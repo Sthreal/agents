@@ -94,6 +94,53 @@ function runTurnAndCollectStartChunks(
   });
 }
 
+/**
+ * Collect the `start` chunks for a continuation turn. Approval continuations
+ * can allocate a new assistant message id even though the frame is marked as a
+ * continuation, so the start chunk still needs to carry the id Think persists
+ * under.
+ */
+function runContinuationAndCollectStartChunks(
+  ws: WebSocket,
+  sendContinuation: () => void,
+  timeout = 15_000
+): Promise<Array<{ messageId?: string }>> {
+  return new Promise((resolve, reject) => {
+    const startChunks: Array<{ messageId?: string }> = [];
+    const timer = setTimeout(
+      () => reject(new Error("Timeout waiting for continuation done")),
+      timeout
+    );
+    const handler = (e: MessageEvent) => {
+      try {
+        const msg = JSON.parse(e.data as string) as Record<string, unknown>;
+        if (msg.type !== MSG_CHAT_RESPONSE) return;
+        if (msg.continuation === true) {
+          if (typeof msg.body === "string" && msg.body.length > 0) {
+            try {
+              const chunk = JSON.parse(msg.body) as { type?: string };
+              if (chunk?.type === "start") {
+                startChunks.push(chunk as { messageId?: string });
+              }
+            } catch {
+              // ignore non-JSON frames
+            }
+          }
+        }
+        if (msg.done === true) {
+          clearTimeout(timer);
+          ws.removeEventListener("message", handler);
+          resolve(startChunks);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    ws.addEventListener("message", handler);
+    sendContinuation();
+  });
+}
+
 describe("Think — streaming assistant message-id alignment", () => {
   it(
     "stamps the persisted assistant id onto a new turn's start chunk",
@@ -130,6 +177,63 @@ describe("Think — streaming assistant message-id alignment", () => {
         { timeout: 8000, interval: 25 }
       );
       expect(start.messageId).toBe(assistant?.id);
+
+      ws.close(1000);
+    }
+  );
+
+  it(
+    "stamps the persisted assistant id onto an approval continuation start chunk",
+    {
+      timeout: 20_000
+    },
+    async () => {
+      const room = crypto.randomUUID();
+      const agent = await getAgentByName(env.ThinkClientToolsAgent, room);
+      await agent.setServerApprovalToolMode(true);
+      const ws = await connectWS(room);
+
+      const initialStarts = await runTurnAndCollectStartChunks(
+        ws,
+        "update the trigger"
+      );
+      expect(initialStarts).toHaveLength(1);
+
+      const continuationStarts = await runContinuationAndCollectStartChunks(
+        ws,
+        () => {
+          ws.send(
+            JSON.stringify({
+              type: "cf_agent_tool_approval",
+              toolCallId: "tc-server-approval-1",
+              approved: true,
+              autoContinue: true
+            })
+          );
+        }
+      );
+
+      expect(continuationStarts).toHaveLength(1);
+      const start = continuationStarts[0];
+      expect(typeof start.messageId).toBe("string");
+      expect(start.messageId).toBeTruthy();
+
+      const reply = await vi.waitFor(
+        async () => {
+          const messages = (await agent.getMessages()) as UIMessage[];
+          const persisted = messages.find(
+            (message) =>
+              message.role === "assistant" &&
+              message.parts.some(
+                (part) => part.type === "text" && part.text === "Trigger updated"
+              )
+          );
+          expect(persisted).toBeDefined();
+          return persisted;
+        },
+        { timeout: 8000, interval: 25 }
+      );
+      expect(start.messageId).toBe(reply?.id);
 
       ws.close(1000);
     }

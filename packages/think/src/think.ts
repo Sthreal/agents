@@ -14290,18 +14290,19 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * otherwise leave the client to generate its own id; the live stream and the
    * persisted message broadcast then can't reconcile by id, and the originating
    * tab briefly renders the turn twice before collapsing. Mirrors the fix in
-   * `@cloudflare/ai-chat`. Continuations are skipped — they reuse the existing
-   * assistant message via the `continuation` frame flag, so the id must not
-   * change mid-message. The orphan-recovery path inherits the id from the
-   * stored chunk, so it needs no separate stamping.
+   * `@cloudflare/ai-chat`. A continuation that extends the existing assistant
+   * message already has the same accumulator id; a continuation that starts a
+   * new assistant message (for example, an approval continuation that does not
+   * extend the leaf) must carry the new id too, otherwise the client builds the
+   * stream under a different id and renders the reply twice. The orphan-recovery
+   * path inherits the id from the stored chunk, so it needs no separate stamping.
    */
   private _alignStreamStartId(
     chunk: StreamChunkData,
     action: { type: string; messageId?: string } | undefined,
-    accumulator: StreamAccumulator,
-    continuation: boolean
+    accumulator: StreamAccumulator
   ): void {
-    if (action?.type === "start" && action.messageId == null && !continuation) {
+    if (action?.type === "start" && action.messageId == null) {
       (chunk as { messageId?: string }).messageId = accumulator.messageId;
     }
   }
@@ -14706,7 +14707,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
             break;
           }
 
-          this._alignStreamStartId(streamChunk, action, accumulator, false);
+          this._alignStreamStartId(streamChunk, action, accumulator);
 
           const chunkBody = JSON.stringify(streamChunk);
           const seq = await this._storeChunkDurably(
@@ -15275,12 +15276,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
             break;
           }
 
-          this._alignStreamStartId(
-            streamChunk,
-            action,
-            accumulator,
-            continuation
-          );
+          this._alignStreamStartId(streamChunk, action, accumulator);
 
           const chunkBody = JSON.stringify(streamChunk);
           const seq = await this._storeChunkDurably(
